@@ -42,6 +42,10 @@ class Client:
         print("Setting game...")
         self.game = game
 
+    def set_name(self, name):
+        print("Setting name...")
+        self.name = name
+
     async def process(self):
         async for msg in self.socket:
             # Maybe also should have max duration or so.. not sure.
@@ -58,11 +62,22 @@ class Client:
     
     def set_winner(self):
         self.state = self.STATE_WINNER
+    
+    async def leave(self):
+        print(f'client is leaving: {self.name}')
+        print(f'game: {self.game}')
+        print(f'state: {self.state}')
+        self.socket = None
+        if self.game is not None and self.state == self.STATE_ALIVE:
+            await self.game.leaving(self)
 
     async def send(self, f):
-        print("Sending..")
-        await self.socket.send(f)
-        print("Done")
+        if self.socket is not None:
+            print("Sending..")
+            await self.socket.send(f)
+            print("Done")
+        else:
+            print(f"NOT sending: client {self.uuid} has left")
     
     def serialize(self):
         return {
@@ -89,6 +104,12 @@ class Game:
         self.clients = [admin_socket]
         self.state = self.GAME_STATE_LOBBY
         self.options = {}
+
+    def is_public(self):
+        return "scope" in self.options and self.options["scope"] == "public"
+    
+    def everybody_left(self):
+        return len([c for c in self.clients if c.socket is not None]) == 0
     
     def get_gameinfo(self):
         users = []
@@ -100,7 +121,8 @@ class Game:
             "name": self.name,
             "status": self.state,
             "users": users,
-            "options": self.options
+            "options": self.options,
+            "admin": self.admin_socket.uuid
         }
 
     async def send_lines(self, lines, sender_uuid):
@@ -134,10 +156,17 @@ class Game:
         self.clients.append(client)
         await self.send_gameinfo()
 
+    async def remove_client(self, client):
+        if self.state != self.GAME_STATE_LOBBY:
+            raise("Game not in lobby")
+        self.clients.remove(client)
+        await self.send_gameinfo()
+
     async def set_options(self, options):
         if self.state != self.GAME_STATE_LOBBY:
             raise("Game not in lobby")
         self.options = options
+        print(f'options: {options}')
         await self.send_gameinfo()
 
     async def start_game(self):
@@ -146,6 +175,51 @@ class Game:
             "type": "start_game",
             "tiles": self.generate_tiles()
         })
+    
+    async def leaving(self, client):
+        print(f'client {client.name} is leaving game {self.name}')
+        # If game is still in lobby, client is removed.
+        if self.state == self.GAME_STATE_LOBBY:
+            # If admin leaves in lobby, promote another client as admin
+            if client == self.admin_socket and len(self.clients) > 1:
+                new_admin = [client for client in self.clients if client != self.admin_socket][0]
+                print(f'Admin is leaving the game: promoting new admin: {new_admin.uuid} {new_admin.name}')
+                self.admin_socket = new_admin
+            print(f'Removing client: {client.name}')
+            await self.remove_client(client)
+        # If game is running, leaving mean forfeiting/dying
+        elif self.state == self.GAME_STATE_RUNNING:
+            print(f'Forfeiting client: {client.name}')
+            await self.dying(client)
+            
+    
+    async def dying(self, client):
+        print(f'game: client dying: {client.name}')
+        if self.state == self.GAME_STATE_FINISHED:
+            print("User might just have died.. ignore")
+            return
+        if self.state != self.GAME_STATE_RUNNING:
+            print("Game is not running. Error.")
+            return
+        print(f"User died: {client.name}")
+        # Get alive count..
+        alive_count = self.alive_count()
+        if alive_count == 2:
+            # We have a winner!
+            client.set_dead()
+            winner = self.get_last_alive()
+            winner.set_winner()
+            await winner.send(json.dumps({
+                "type": "win"
+            }))
+            self.state = self.GAME_STATE_FINISHED
+        elif alive_count > 1:
+            print("Set dead")
+            client.set_dead()
+        else:
+            print("Solo")
+            client.set_dead()
+        await self.send_gameinfo()
     
     def alive_count(self):
         count = 0
@@ -191,18 +265,7 @@ class Game:
 
     async def process(self, client, msg):
         print(f"Processing {client.name} with msg {msg}")
-        if msg["type"] == "options":
-            # Check if game state is correct.
-            if self.state != self.GAME_STATE_LOBBY:
-                print("Error: Game already running or finished")
-                return
-            # Check if admin.
-            if client != self.admin_socket:
-                print("Error: Not an admin.")
-                return
-            print("Setting game options.")
-            await self.set_options(msg["options"])
-        elif msg["type"] == "start":
+        if msg["type"] == "start":
             # Check if game state is correct.
             if self.state != self.GAME_STATE_LOBBY:
                 print("Error: Game already running or finished")
@@ -227,31 +290,7 @@ class Game:
                 return
             await self.send_lines(msg["lines"], client.uuid)
         elif msg["type"] == "dead":
-            if self.state == self.GAME_STATE_FINISHED:
-                print("User might just have died.. ignore")
-                return
-            if self.state != self.GAME_STATE_RUNNING:
-                print("Game is not running. Error.")
-                return
-            print("User died")
-            # Get alive count..
-            alive_count = self.alive_count()
-            if alive_count == 2:
-                # We have a winner!
-                client.set_dead()
-                winner = self.get_last_alive()
-                winner.set_winner()
-                await winner.send(json.dumps({
-                    "type": "win"
-                }))
-                self.state = self.GAME_STATE_FINISHED
-            elif alive_count > 1:
-                print("Set dead")
-                client.set_dead()
-            else:
-                print("Solo")
-                client.set_dead()
-            await self.send_gameinfo()
+            await self.dying(client)
         
             
 
@@ -272,6 +311,60 @@ def parse_register_msg(msg):
         return None
     
     return j
+
+async def process_client(client):
+    # The iterator exits normally when the connection is closed with close code 1000 (OK) or 1001 (going away) or without a close code. It raises a ConnectionClosedError when the connection is closed with any other code.
+    async for msg in client.socket:
+        j = json.loads(msg)
+        print(f"Processing {client.name} with msg {msg}")
+        if j["type"] == "list":
+            print("List games")
+            gamesInfos = [games[name].get_gameinfo() for name in games if games[name].is_public()]
+            lobbyInfo = {
+                "type": "lobby_info",
+                "games": gamesInfos
+            }
+            lobby_info = json.dumps(lobbyInfo)
+            await client.send(lobby_info)
+            print("Done")
+        elif j["type"] == "create":
+            print("Create game")
+            new_game = Game(client)
+            while new_game.name in games:
+                new_game = Game(client)
+            client.set_game(new_game)
+
+            print("Setting game options.")
+            await new_game.set_options(j["options"])
+
+            print("Done")
+
+            games[new_game.name] = new_game
+
+            await client.process()
+        elif j["type"] == "join":
+            game_name = j["game_code"]
+            print(f"join game with id: >{game_name}<")
+            if not game_name in games:
+                error = {
+                    "type": "error",
+                    "msg": "Game not found."
+                }
+                await websocket.send(json.dumps(error))
+                return
+
+            game = games[game_name]
+            client.set_game(game)
+
+            await game.add_client(client)
+
+            print("Sending gameinfo..")
+            await game.send_gameinfo()
+            await client.process()
+        elif j["type"] == "rename":
+            print(f'Renaming player: {client.name} --> {j["name"]}')
+            client.set_name(j["name"])
+            print("Done")
 
 async def newserver(websocket, path):
     print("Newserver")
@@ -297,53 +390,31 @@ async def newserver(websocket, path):
         "uuid": client.uuid
     }))
 
-    # Either create a new game
-    if(path == "/create"):
-        print("Create game")
-        new_game = Game(client)
-        while new_game.name in games:
-            new_game = Game(client)
-        client.set_game(new_game)
+    await process_client(client)
 
-        print("Sending gameinfo..")
-        await new_game.send_gameinfo()
-        print("Done")
+    # Client disconnected
+    print(f"DONE PROCESSING client with name: {name}")
 
-        games[new_game.name] = new_game
-
-        await client.process()
-    # Or join an existing game
-    elif(path.startswith("/join/")):
-        game_name = path[6:]
-        print(f"join game with id: >{game_name}<")
-        if not game_name in games:
-            error = {
-                "type": "error",
-                "msg": "Game not found."
-            }
-            await websocket.send(json.dumps(error))
-            return
-
-        game = games[game_name]
-        client.set_game(game)
-
-        await game.add_client(client)
-
-        print("Sending gameinfo..")
-        await game.send_gameinfo()
-        await client.process()
-
-        
-    else:
-        print(f"Unhandled path: {path}")
+    # Remove client from game
+    if client.game is not None:
+        print(f'Client disconnected: leaving game {client.game.name} with {len(client.game.clients)} clients...')
+        await client.leave()
+        # Remove client's game if all players have left
+        if client.game.everybody_left():
+            print(f'Game is empty: removing {client.game.name}')
+            del games[client.game.name]
+            print(f'Removed game: remaining {len(games)} games')
 
 
 
-ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ssl_context = None
 cert = "..."
 key = "..."
 
-ssl_context.load_cert_chain(certfile=cert, keyfile=key)
+if cert != "..." and key != "...":
+    print('Setting up SSL context')
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(certfile=cert, keyfile=key)
 
 start_server = websockets.serve(newserver, '0.0.0.0', 5678, ping_interval=None, ssl=ssl_context)
 asyncio.get_event_loop().run_until_complete(start_server)
